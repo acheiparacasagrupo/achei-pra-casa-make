@@ -15,7 +15,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: novo-short
+  group: grava-repo
   cancel-in-progress: false
 
 jobs:
@@ -30,11 +30,10 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Instalar FFmpeg, Python e navegador
+      - name: Instalar FFmpeg e Python
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
           pip install -q -r requirements.txt
-          python -m playwright install --with-deps chromium
 
       - name: Gerar Short e enviar para o Make
         env:
@@ -54,13 +53,14 @@ jobs:
           path: |
             tmp/short.mp4
             tmp/roteiro.json
-            tmp/diag_*.png
           retention-days: 7
           if-no-files-found: ignore
 
       - name: Salvar histórico (não repetir produto)
+        if: always()
         run: |
           git config user.name "achei-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add historico.json
+          python3 -c "import json;h={x['id'] for x in json.load(open('historico.json'))};f=json.load(open('fila.json'));json.dump([p for p in f if p['id'] not in h],open('fila.json','w'),ensure_ascii=False,indent=2)"
+          git add historico.json fila.json
           git diff --cached --quiet || (git commit -m "historico: novo short" && git pull --rebase && git push)

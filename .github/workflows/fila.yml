@@ -1,0 +1,25 @@
+name: Receber fila (extensão do Chrome)
+
+on:
+  repository_dispatch:
+    types: [fila_ml]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: grava-repo
+  cancel-in-progress: false
+
+jobs:
+  fila:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 receber_fila.py
+      - run: |
+          git config user.name "achei-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add fila.json
+          git diff --cached --quiet || (git commit -m "fila: produtos da extensão" && git pull --rebase && git push)
