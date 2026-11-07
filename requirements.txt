@@ -1,0 +1,5 @@
+requests>=2.31
+edge-tts>=6.1.12
+yt-dlp
+google-api-python-client>=2.120
+google-auth>=2.28
