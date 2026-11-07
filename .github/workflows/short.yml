@@ -54,6 +54,7 @@ jobs:
           path: |
             tmp/short.mp4
             tmp/roteiro.json
+            tmp/diag_*.png
           retention-days: 7
           if-no-files-found: ignore
 
