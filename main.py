@@ -12,6 +12,7 @@ GitHub Actions (3x por dia):
 Make: recebe o webhook -> baixa o vídeo -> posta no YouTube pela conta conectada no próprio Make.
 """
 import html
+import unicodedata
 import json
 import os
 import re
@@ -32,6 +33,8 @@ VELOCIDADE_VOZ = os.getenv("VELOCIDADE_VOZ") or "+12%"
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("1", "true")
 REPO = os.getenv("GITHUB_REPOSITORY", "")
 
+COMENTARIO = os.getenv("COMENTARIO") or ("🔴 O LINK DO GRUPO VIP COM OFERTAS PRA CASA TODO DIA TÁ NA BIO DO CANAL! 👆 "
+                                         "Toca no nome do canal e entra no grupo do WhatsApp 🛒")
 MAX_MB = 4.3  # Make grátis aceita arquivos de até 5 MB
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
@@ -99,7 +102,8 @@ Responda SOMENTE um JSON com:
    "CHEGA DE SOFRER PRA LIMPAR O FOGÃO", "NUNCA MAIS PERCA TEMPO DOBRANDO ROUPA"
 - "nome_curto": nome do produto em CAIXA ALTA, 2 a 4 palavras, sem marca (ex: "MINI TRITURADOR ELETRICO")
 - "hashtags_titulo": exatamente 3 hashtags: "#achadinhos", "#shopee" e uma do contexto (ex: "#dicas", "#cozinha", "#limpeza")
-- "hashtags_descricao": 4 hashtags: "#achadinhos", "#compras" e 2 do contexto (ex: "#donadecasa", "#organizacao")
+- "hashtags_contexto": 4 hashtags específicas do produto/dor, em minúsculas, sem acento, populares no Brasil
+   (ex: "#limpezadecasa", "#cozinhapratica", "#organizacao", "#donadecasa", "#casaorganizada", "#utilidades")
 - "tags": 12 tags em minúsculas: "achadinhos", "achadinhos para casa", "achadinhos shopee", "compras para casa"
    e 8 específicas (o que é o produto e como as pessoas pesquisam a dor, ex: "como cortar cebola sem chorar")
 - "narracao": 45 a 60 palavras (20 a 25 segundos), português do Brasil natural, MUITO persuasivo, frases curtas:
@@ -169,6 +173,20 @@ def montar(video, narracao):
 
 
 # ----------------------------------------------------------------- 6. RELEASE + MAKE
+HASHTAGS_FIXAS = ["#achadinhos", "#achadinhosparacasa", "#shorts", "#compras", "#casa"]
+
+
+def hashtags_descricao(r):
+    vistas, out = set(), []
+    for h in HASHTAGS_FIXAS + list(r.get("hashtags_contexto") or r.get("hashtags_descricao") or []):
+        h = unicodedata.normalize("NFKD", h.lower().lstrip("#")).encode("ascii", "ignore").decode()
+        h = "#" + re.sub(r"[^a-z0-9]", "", h)
+        if len(h) > 2 and h not in vistas and h not in r.get("hashtags_titulo", []):
+            vistas.add(h)
+            out.append(h)
+    return out[:9]  # 3 no título + 9 na descrição = 12 (o YouTube ignora tudo acima de 15)
+
+
 def descricao(r, prod):
     return ("🛍️ LINK DE TODOS OS PRODUTOS AQUI\n\n"
             f"🔴GRUPO VIP DE PROMOÇÕES NO WHATSAPP🔴\n{GRUPO_WHATSAPP}\n\n"
@@ -176,7 +194,7 @@ def descricao(r, prod):
             f"🟢GRUPO DE OFERTAS E CUPONS DE DESCONTO🟢\n{GRUPO_WHATSAPP}\n"
             "O grupo é somente de postagem de produtos, sem chat.\n"
             "Nele você encontra achadinhos para casa com cupons de desconto todos os dias!\n\n"
-            + " ".join(r["hashtags_descricao"]))
+            + " ".join(hashtags_descricao(r)))
 
 
 def publicar_release(arquivo, tag):
@@ -228,7 +246,7 @@ def main():
     payload = {"titulo": titulo, "descricao": descricao(r, prod).replace("<", "").replace(">", ""),
                "tags": ",".join(t.replace(",", " ") for t in r["tags"][:15]),
                "produto": prod["titulo"], "link_produto": prod["link"], "narracao": r["narracao"],
-               "comentario": f"🔴 GRUPO VIP DE ACHADINHOS PRA CASA COM DESCONTO TODO DIA 👉 {GRUPO_WHATSAPP}"}
+               "comentario": COMENTARIO}
     (TMP / "roteiro.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     if DRY_RUN:
         log("DRY_RUN: vídeo pronto, não publicado. Baixe em Artifacts.")
