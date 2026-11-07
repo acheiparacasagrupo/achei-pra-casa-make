@@ -1,0 +1,70 @@
+name: Novo Short (Achei pra Casa)
+
+on:
+  repository_dispatch:
+    types: [novo_short]          # disparado pelo cenário do Make
+  workflow_dispatch:             # botão "Run workflow" para testes
+    inputs:
+      ml_token:
+        description: "Access token do Mercado Livre (opcional no teste)"
+        required: false
+      dry_run:
+        description: "true = só monta o vídeo, não publica"
+        default: "true"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: novo-short
+  cancel-in-progress: false
+
+jobs:
+  short:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar FFmpeg e dependências
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+          pip install -q -r requirements.txt
+          pip install -q -U yt-dlp
+
+      - name: Gerar e publicar Short
+        env:
+          ML_ACCESS_TOKEN: ${{ github.event.client_payload.ml_token || inputs.ml_token }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          YT_COOKIES: ${{ secrets.YT_COOKIES }}
+          PRIVACIDADE: ${{ vars.PRIVACIDADE || 'public' }}
+          SOMENTE_CREATIVE_COMMONS: ${{ vars.SOMENTE_CREATIVE_COMMONS || 'true' }}
+          VOZ: ${{ vars.VOZ || 'pt-BR-AntonioNeural' }}
+        run: python main.py
+
+      - name: Guardar vídeo gerado (download na aba Actions, 7 dias)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: short-${{ github.run_number }}
+          path: |
+            tmp/short.mp4
+            tmp/roteiro.json
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Salvar histórico (anti-repetição)
+        run: |
+          git config user.name "achei-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add historico.json
+          git diff --cached --quiet || (git commit -m "historico: novo short" && git push)
