@@ -2,9 +2,10 @@
 Achei pra Casa — fábrica automática de Shorts (100% grátis, SEM API do Mercado Livre e SEM API do YouTube)
 
 GitHub Actions (3x por dia):
- 1. Abre a página pública "Mais vendidos" do Mercado Livre (categorias de casa) e coleta os produtos
+ 1. Lê a fila.json (preenchida pela extensão "Achei pra Casa - Coletor" no seu Chrome, com os
+    mais vendidos de casa do Mercado Livre e os links dos VÍDEOS REAIS dos anúncios)
  2. Gemini ranqueia: qual resolve a DOR mais forte e tem mais cara de viral
- 3. Abre a página do produto e pega o VÍDEO REAL (clips do próprio anúncio)
+ 3. Baixa os clips reais do anúncio (CDN público do ML)
  4. Gemini escreve título, descrição, tags e narração (dor -> solução -> CTA do grupo)
  5. Narração com voz natural (edge-tts) + montagem 9:16 com FFmpeg (< 5 MB, limite do Make grátis)
  6. Publica o vídeo como Release do GitHub e avisa o Make (webhook)
@@ -31,15 +32,6 @@ VELOCIDADE_VOZ = os.getenv("VELOCIDADE_VOZ") or "+12%"
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("1", "true")
 REPO = os.getenv("GITHUB_REPOSITORY", "")
 
-BASE_MV = "https://www.mercadolivre.com.br/mais-vendidos/MLB1574"  # Casa, Móveis e Decoração
-# subcategorias com mais "achadinho que resolve dor" (nomes como aparecem no site)
-SUBCATS_PREFERIDAS = ["Cozinha", "Organização para Casa", "Cuidado da Casa e Lavanderia", "Banheiros",
-                      "Iluminação Residencial", "Segurança para Casa", "Jardim e Ar Livre"]
-EXTRAS = ["https://www.mercadolivre.com.br/mais-vendidos/MLB5726"]  # Eletrodomésticos (mini processador, etc.)
-BLOQUEADAS = ["papel higiênico", "papel higienico", "lava roupas", "sabão", "detergente", "água sanitária",
-              "agua sanitaria", "lençol", "lencol", "colchão", "colchao", "cortina", "sofá", "guarda-roupa",
-              "geladeira", "fogão", "fogao", "máquina de lavar", "ar condicionado", "tapete", "colcha", "ducha"]
-
 MAX_MB = 4.3  # Make grátis aceita arquivos de até 5 MB
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
@@ -59,97 +51,7 @@ def run(cmd, **kw):
     return subprocess.run(cmd, check=True, **kw)
 
 
-def pid(url):
-    m = re.search(r"/p/(MLB\d+)", url) or re.search(r"(MLB)-?(\d+)", url)
-    if not m:
-        return url
-    return m.group(1) if m.lastindex == 1 else f"MLB{m.group(2)}"
-
-
-# ----------------------------------------------------------------- 1. MAIS VENDIDOS (sem API)
-SUBCAT_URLS = [f"https://www.mercadolivre.com.br/mais-vendidos/{c}" for c in (
-    "MLB1618",    # Cozinha
-    "MLB436414",  # Organização para Casa
-    "MLB264051",  # Cuidado da Casa e Lavanderia
-    "MLB1613",    # Banheiros
-    "MLB1582",    # Iluminação Residencial
-    "MLB7069",    # Segurança para Casa
-    "MLB1621",    # Jardim e Ar Livre
-)] + EXTRAS
-
-JS_ITENS = """els => els.map(a => {
-    const card = a.closest('.poly-card') || a.parentElement.parentElement;
-    return {titulo: a.innerText.trim(), link: a.href.split('#')[0].split('?')[0],
-            info: (card ? card.innerText : '').replace(/\\s+/g,' ').slice(0, 200)};
-})"""
-
-
-def diagnostico(page, nome):
-    try:
-        log("DIAG", nome, "| url:", page.url[:120], "| titulo:", page.title()[:80])
-        log("DIAG texto:", page.inner_text("body")[:300].replace("\n", " "))
-        page.screenshot(path=str(TMP / f"diag_{nome}.png"))
-    except Exception as e:
-        log("DIAG falhou:", e)
-
-
-def coletar(page, historico):
-    ja = {h["id"] for h in historico}
-    produtos = {}
-    for n, url in enumerate(SUBCAT_URLS):
-        itens = []
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(2500)
-            for _ in range(3):
-                page.mouse.wheel(0, 2500)
-                page.wait_for_timeout(600)
-            itens = page.eval_on_selector_all("a.poly-component__title", JS_ITENS)
-        except Exception as e:
-            log("falha em", url, e)
-        log(len(itens), "itens (navegador) em", url)
-        if not itens:
-            if n == 0:
-                diagnostico(page, "lista")
-        for it in itens:
-            it["id"] = pid(it["link"])
-            low = it["titulo"].lower()
-            if it["id"] in ja or any(b in low for b in BLOQUEADAS):
-                continue
-            produtos.setdefault(it["id"], it)
-        if len(produtos) >= 60:
-            break
-    log(len(produtos), "produtos novos coletados")
-    return list(produtos.values())
-
-
-def videos_do_produto(page, link):
-    """Os clips do anúncio vêm no HTML como "video_url": ".../playlists/....m3u8"."""
-    src = ""
-    try:
-        page.goto(link, wait_until="domcontentloaded", timeout=60000)
-        page.wait_for_timeout(2500)
-        src = page.content()
-    except Exception as e:
-        log("produto falhou no navegador:", e)
-    if '"video_url"' not in src:
-        if "video_url" not in src and src:
-            diagnostico(page, "produto")
-    urls = []
-    for m in re.finditer(r'"video_url"\s*:\s*"([^"]+)"', src):
-        try:
-            u = json.loads('"' + m.group(1) + '"')
-        except ValueError:
-            u = m.group(1)
-        u = html.unescape(u)
-        if u.startswith("http") and u not in urls:
-            urls.append(u)
-    desc = ""
-    try:
-        desc = page.inner_text(".ui-pdp-description__content", timeout=2000)[:1200]
-    except Exception:
-        pass
-    return urls[:3], desc
+FILA = Path(__file__).parent / "fila.json"
 
 
 # ----------------------------------------------------------------- 2/4. GEMINI
@@ -172,7 +74,7 @@ def gemini_json(prompt, temperatura=0.8):
 
 def ranquear(produtos):
     topo = produtos[:60]
-    lista = "\n".join(f"{i}: {p['titulo'][:100]} | {p['info'][:90]}" for i, p in enumerate(topo))
+    lista = "\n".join(f"{i}: {p['titulo'][:100]} | {p.get('info','')[:90]}" for i, p in enumerate(topo))
     r = gemini_json(
         "Você escolhe produtos para Shorts virais de 'achadinhos para casa'. Abaixo estão os mais vendidos do "
         "Mercado Livre. Ordene do MELHOR para o pior: resolve uma DOR clara do dia a dia, é visual/demonstrável "
@@ -208,7 +110,7 @@ Responda SOMENTE um JSON com:
 
 
 def roteiro(prod, desc):
-    return gemini_json(PROMPT_ROTEIRO.format(titulo=prod["titulo"], info=prod["info"], desc=desc[:1000]), 0.9)
+    return gemini_json(PROMPT_ROTEIRO.format(titulo=prod["titulo"], info=prod.get("info", ""), desc=desc[:1000]), 0.9)
 
 
 # ----------------------------------------------------------------- 3/5. VÍDEO + VOZ + MONTAGEM
@@ -295,39 +197,33 @@ def avisar_make(payload):
 
 # ----------------------------------------------------------------- MAIN
 def main():
-    from playwright.sync_api import sync_playwright
     historico = json.loads(HIST.read_text(encoding="utf-8")) if HIST.exists() else []
-    with sync_playwright() as p:
-        nav = p.chromium.launch(headless=True)
-        page = nav.new_context(user_agent=UA, locale="pt-BR", viewport={"width": 1366, "height": 900}).new_page()
-        candidatos = coletar(page, historico)
-        if not candidatos:
-            sys.exit("Nenhum produto coletado (o ML pode ter mudado o layout ou bloqueado o acesso).")
-        escolhido = None
-        for prod in ranquear(candidatos):
-            log("Checando vídeo de:", prod["titulo"])
-            try:
-                clips, desc = videos_do_produto(page, prod["link"])
-            except Exception as e:
-                log("página falhou:", e)
-                continue
-            if not clips:
-                log("  sem vídeo no anúncio")
-                continue
-            video = baixar_clips(clips)
-            if video:
-                escolhido = (prod, desc, video)
-                break
-        nav.close()
+    fila = json.loads(FILA.read_text(encoding="utf-8")) if FILA.exists() else []
+    feitos = {h["id"] for h in historico}
+    fila = [p for p in fila if p["id"] not in feitos and p.get("videos")]
+    if not fila:
+        log("Fila vazia: a extensão do Chrome ainda não mandou produtos novos. Nada a fazer agora.")
+        return
+    escolhido = None
+    for prod in ranquear(fila):
+        log("Tentando:", prod["titulo"])
+        video = baixar_clips(prod["videos"])
+        if video:
+            escolhido = (prod, video)
+            break
+        log("  vídeos não baixaram; removendo da fila")
+        historico.append({"id": prod["id"], "produto": prod["titulo"], "erro": "video", "data": time.strftime("%Y-%m-%d %H:%M")})
     if not escolhido:
-        sys.exit("Nenhum dos melhores produtos tinha vídeo real nesta rodada.")
+        HIST.write_text(json.dumps(historico, ensure_ascii=False, indent=2), encoding="utf-8")
+        sys.exit("Nenhum vídeo da fila pôde ser baixado.")
 
-    prod, desc, video = escolhido
-    r = roteiro(prod, desc)
+    prod, video = escolhido
+    r = roteiro(prod, prod.get("descricao", ""))
     log("Produto:", prod["titulo"], "| dor:", r.get("dor"))
     final = montar(video, narrar(r["narracao"]))
-    titulo = f"{r['titulo'].upper()}   {' '.join(r['hashtags_titulo'])}"[:100]
-    payload = {"titulo": titulo, "descricao": descricao(r, prod), "tags": ",".join(r["tags"][:15]),
+    titulo = f"{r['titulo'].upper()}   {' '.join(r['hashtags_titulo'])}"[:100].replace("<", "").replace(">", "")
+    payload = {"titulo": titulo, "descricao": descricao(r, prod).replace("<", "").replace(">", ""),
+               "tags": ",".join(t.replace(",", " ") for t in r["tags"][:15]),
                "produto": prod["titulo"], "link_produto": prod["link"], "narracao": r["narracao"],
                "comentario": f"🔴 GRUPO VIP DE ACHADINHOS PRA CASA COM DESCONTO TODO DIA 👉 {GRUPO_WHATSAPP}"}
     (TMP / "roteiro.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
