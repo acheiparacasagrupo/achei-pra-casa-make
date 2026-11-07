@@ -1,16 +1,15 @@
 name: Novo Short (Achei pra Casa)
 
 on:
-  repository_dispatch:
-    types: [novo_short]          # disparado pelo cenário do Make
-  workflow_dispatch:             # botão "Run workflow" para testes
+  schedule:                      # 3 Shorts por dia (horário de Brasília)
+    - cron: "40 13 * * *"        # 10:40
+    - cron: "10 19 * * *"        # 16:10
+    - cron: "20 23 * * *"        # 20:20
+  workflow_dispatch:
     inputs:
-      ml_token:
-        description: "Access token do Mercado Livre (opcional no teste)"
-        required: false
       dry_run:
-        description: "true = só monta o vídeo, não publica"
-        default: "true"
+        description: "true = só gera o vídeo (baixe em Artifacts), não publica"
+        default: "false"
 
 permissions:
   contents: write
@@ -31,27 +30,23 @@ jobs:
           python-version: "3.12"
           cache: pip
 
-      - name: Instalar FFmpeg e dependências
+      - name: Instalar FFmpeg, Python e navegador
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
           pip install -q -r requirements.txt
-          pip install -q -U yt-dlp
+          python -m playwright install --with-deps chromium
 
-      - name: Gerar e publicar Short
+      - name: Gerar Short e enviar para o Make
         env:
-          ML_ACCESS_TOKEN: ${{ github.event.client_payload.ml_token || inputs.ml_token }}
-          DRY_RUN: ${{ inputs.dry_run || 'false' }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
-          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
-          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
-          YT_COOKIES: ${{ secrets.YT_COOKIES }}
-          PRIVACIDADE: ${{ vars.PRIVACIDADE || 'public' }}
-          SOMENTE_CREATIVE_COMMONS: ${{ vars.SOMENTE_CREATIVE_COMMONS || 'true' }}
-          VOZ: ${{ vars.VOZ || 'pt-BR-AntonioNeural' }}
+          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
+          GH_TOKEN: ${{ github.token }}
+          DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          VOZ: ${{ vars.VOZ }}
+          GRUPO_WHATSAPP: ${{ vars.GRUPO_WHATSAPP }}
         run: python main.py
 
-      - name: Guardar vídeo gerado (download na aba Actions, 7 dias)
+      - name: Guardar vídeo gerado (aba Actions > Artifacts)
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -62,9 +57,9 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-      - name: Salvar histórico (anti-repetição)
+      - name: Salvar histórico (não repetir produto)
         run: |
           git config user.name "achei-bot"
           git config user.email "actions@users.noreply.github.com"
           git add historico.json
-          git diff --cached --quiet || (git commit -m "historico: novo short" && git push)
+          git diff --cached --quiet || (git commit -m "historico: novo short" && git pull --rebase && git push)
