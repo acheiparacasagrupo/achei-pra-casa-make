@@ -93,25 +93,6 @@ def diagnostico(page, nome):
         log("DIAG falhou:", e)
 
 
-def itens_via_jina(url):
-    """Plano B: leitor público r.jina.ai (outro IP) devolve a página em markdown."""
-    try:
-        r = requests.get("https://r.jina.ai/" + url, headers={"X-Return-Format": "markdown"}, timeout=90)
-        md = r.text
-    except Exception as e:
-        log("jina falhou:", e)
-        return []
-    itens, vistos = [], set()
-    for m in re.finditer(r"\[([^\]]{12,200})\]\((https://(?:www|produto)\.mercadolivre\.com\.br/[^)\s]+)\)", md):
-        titulo, link = m.group(1).strip(), m.group(2).split("#")[0].split("?")[0]
-        if ("/p/MLB" not in link and "MLB-" not in link) or link in vistos or titulo.startswith("!"):
-            continue
-        vistos.add(link)
-        itens.append({"titulo": titulo, "link": link, "info": ""})
-    log("jina:", len(itens), "itens em", url)
-    return itens
-
-
 def coletar(page, historico):
     ja = {h["id"] for h in historico}
     produtos = {}
@@ -130,7 +111,6 @@ def coletar(page, historico):
         if not itens:
             if n == 0:
                 diagnostico(page, "lista")
-            itens = itens_via_jina(url)
         for it in itens:
             it["id"] = pid(it["link"])
             low = it["titulo"].lower()
@@ -155,10 +135,6 @@ def videos_do_produto(page, link):
     if '"video_url"' not in src:
         if "video_url" not in src and src:
             diagnostico(page, "produto")
-        try:
-            src += requests.get("https://r.jina.ai/" + link, headers={"X-Return-Format": "html"}, timeout=90).text
-        except Exception as e:
-            log("jina produto falhou:", e)
     urls = []
     for m in re.finditer(r'"video_url"\s*:\s*"([^"]+)"', src):
         try:
