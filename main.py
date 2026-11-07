@@ -67,45 +67,98 @@ def pid(url):
 
 
 # ----------------------------------------------------------------- 1. MAIS VENDIDOS (sem API)
+SUBCAT_URLS = [f"https://www.mercadolivre.com.br/mais-vendidos/{c}" for c in (
+    "MLB1618",    # Cozinha
+    "MLB436414",  # Organização para Casa
+    "MLB264051",  # Cuidado da Casa e Lavanderia
+    "MLB1613",    # Banheiros
+    "MLB1582",    # Iluminação Residencial
+    "MLB7069",    # Segurança para Casa
+    "MLB1621",    # Jardim e Ar Livre
+)] + EXTRAS
+
+JS_ITENS = """els => els.map(a => {
+    const card = a.closest('.poly-card') || a.parentElement.parentElement;
+    return {titulo: a.innerText.trim(), link: a.href.split('#')[0].split('?')[0],
+            info: (card ? card.innerText : '').replace(/\\s+/g,' ').slice(0, 200)};
+})"""
+
+
+def diagnostico(page, nome):
+    try:
+        log("DIAG", nome, "| url:", page.url[:120], "| titulo:", page.title()[:80])
+        log("DIAG texto:", page.inner_text("body")[:300].replace("\n", " "))
+        page.screenshot(path=str(TMP / f"diag_{nome}.png"))
+    except Exception as e:
+        log("DIAG falhou:", e)
+
+
+def itens_via_jina(url):
+    """Plano B: leitor público r.jina.ai (outro IP) devolve a página em markdown."""
+    try:
+        r = requests.get("https://r.jina.ai/" + url, headers={"X-Return-Format": "markdown"}, timeout=90)
+        md = r.text
+    except Exception as e:
+        log("jina falhou:", e)
+        return []
+    itens, vistos = [], set()
+    for m in re.finditer(r"\[([^\]]{12,200})\]\((https://(?:www|produto)\.mercadolivre\.com\.br/[^)\s]+)\)", md):
+        titulo, link = m.group(1).strip(), m.group(2).split("#")[0].split("?")[0]
+        if ("/p/MLB" not in link and "MLB-" not in link) or link in vistos or titulo.startswith("!"):
+            continue
+        vistos.add(link)
+        itens.append({"titulo": titulo, "link": link, "info": ""})
+    log("jina:", len(itens), "itens em", url)
+    return itens
+
+
 def coletar(page, historico):
     ja = {h["id"] for h in historico}
-    page.goto(BASE_MV, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(2500)
-    subcats = page.eval_on_selector_all(
-        "a.ui-search-link", "els => els.map(a => [a.innerText.trim(), a.href.split('#')[0].split('?')[0]])")
-    urls = [u for n, u in subcats if n in SUBCATS_PREFERIDAS and "/mais-vendidos/" in u] + EXTRAS
-    log("Subcategorias:", len(urls))
     produtos = {}
-    for url in urls:
+    for n, url in enumerate(SUBCAT_URLS):
+        itens = []
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(2500)
             for _ in range(3):
                 page.mouse.wheel(0, 2500)
                 page.wait_for_timeout(600)
-            itens = page.eval_on_selector_all("a.poly-component__title", """els => els.map(a => {
-                const card = a.closest('.poly-card') || a.parentElement.parentElement;
-                return {titulo: a.innerText.trim(), link: a.href.split('#')[0].split('?')[0],
-                        info: (card ? card.innerText : '').replace(/\\s+/g,' ').slice(0, 200)};
-            })""")
+            itens = page.eval_on_selector_all("a.poly-component__title", JS_ITENS)
         except Exception as e:
             log("falha em", url, e)
-            continue
+        log(len(itens), "itens (navegador) em", url)
+        if not itens:
+            if n == 0:
+                diagnostico(page, "lista")
+            itens = itens_via_jina(url)
         for it in itens:
             it["id"] = pid(it["link"])
             low = it["titulo"].lower()
             if it["id"] in ja or any(b in low for b in BLOQUEADAS):
                 continue
             produtos.setdefault(it["id"], it)
+        if len(produtos) >= 60:
+            break
     log(len(produtos), "produtos novos coletados")
     return list(produtos.values())
 
 
 def videos_do_produto(page, link):
     """Os clips do anúncio vêm no HTML como "video_url": ".../playlists/....m3u8"."""
-    page.goto(link, wait_until="domcontentloaded", timeout=60000)
-    page.wait_for_timeout(2500)
-    src = page.content()
+    src = ""
+    try:
+        page.goto(link, wait_until="domcontentloaded", timeout=60000)
+        page.wait_for_timeout(2500)
+        src = page.content()
+    except Exception as e:
+        log("produto falhou no navegador:", e)
+    if '"video_url"' not in src:
+        if "video_url" not in src and src:
+            diagnostico(page, "produto")
+        try:
+            src += requests.get("https://r.jina.ai/" + link, headers={"X-Return-Format": "html"}, timeout=90).text
+        except Exception as e:
+            log("jina produto falhou:", e)
     urls = []
     for m in re.finditer(r'"video_url"\s*:\s*"([^"]+)"', src):
         try:
@@ -117,7 +170,7 @@ def videos_do_produto(page, link):
             urls.append(u)
     desc = ""
     try:
-        desc = page.inner_text(".ui-pdp-description__content", timeout=3000)[:1200]
+        desc = page.inner_text(".ui-pdp-description__content", timeout=2000)[:1200]
     except Exception:
         pass
     return urls[:3], desc
