@@ -72,7 +72,7 @@ def gemini_json(prompt, temperatura=0.8):
     raise RuntimeError("Gemini falhou em todos os modelos")
 
 
-def ranquear(produtos):
+def ranquear(produtos, recentes=()):
     topo = produtos[:60]
     lista = "\n".join(f"{i}: {p['titulo'][:100]} | {p.get('info','')[:90]}" for i, p in enumerate(topo))
     r = gemini_json(
@@ -80,6 +80,8 @@ def ranquear(produtos):
         "Mercado Livre. Ordene do MELHOR para o pior: resolve uma DOR clara do dia a dia, é visual/demonstrável "
         "em vídeo, tem efeito 'uau', é barato e de compra por impulso. Descarte itens comuns de supermercado, "
         "roupa de cama e produtos sem apelo visual.\n"
+        "IMPORTANTE: varie! NÃO escolha primeiro um produto do mesmo tipo destes postados recentemente: "
+        + "; ".join(recentes) + "\n"
         'Responda JSON: {"ordem": [índices, no máximo 10]}\n\n' + lista, 0.4)
     ordem = [i for i in r.get("ordem", []) if isinstance(i, int) and 0 <= i < len(topo)]
     return [topo[i] for i in ordem] or topo[:10]
@@ -205,7 +207,8 @@ def main():
         log("Fila vazia: a extensão do Chrome ainda não mandou produtos novos. Nada a fazer agora.")
         return
     escolhido = None
-    for prod in ranquear(fila):
+    recentes = [h.get("produto", "")[:60] for h in historico[-8:] if h.get("produto")]
+    for prod in ranquear(fila, recentes):
         log("Tentando:", prod["titulo"])
         video = baixar_clips(prod["videos"])
         if video:
