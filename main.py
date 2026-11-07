@@ -1,19 +1,18 @@
 """
-Achei pra Casa — fábrica automática de Shorts (100% grátis)
+Achei pra Casa — fábrica automática de Shorts (100% grátis, SEM API do Mercado Livre e SEM API do YouTube)
 
-Fluxo:
- 1. Busca os MAIS VENDIDOS de categorias de casa no Mercado Livre (API oficial /highlights)
- 2. Gemini escolhe o produto que mais resolve uma DOR e escreve título, descrição, tags e narração
- 3. Pega um vídeo REAL do produto (vídeo do anúncio no ML; se não tiver, busca no YouTube)
- 4. Gera narração em voz natural (edge-tts, grátis) e monta o Short 9:16 com FFmpeg
- 5. Publica no YouTube no modelo do canal + comenta o link do grupo VIP
- 6. Salva em historico.json para nunca repetir produto
-
-Quem dispara: o cenário do Make (repository_dispatch) enviando o access_token do Mercado Livre.
+GitHub Actions (3x por dia):
+ 1. Abre a página pública "Mais vendidos" do Mercado Livre (categorias de casa) e coleta os produtos
+ 2. Gemini ranqueia: qual resolve a DOR mais forte e tem mais cara de viral
+ 3. Abre a página do produto e pega o VÍDEO REAL (clips do próprio anúncio)
+ 4. Gemini escreve título, descrição, tags e narração (dor -> solução -> CTA do grupo)
+ 5. Narração com voz natural (edge-tts) + montagem 9:16 com FFmpeg (< 5 MB, limite do Make grátis)
+ 6. Publica o vídeo como Release do GitHub e avisa o Make (webhook)
+Make: recebe o webhook -> baixa o vídeo -> posta no YouTube pela conta conectada no próprio Make.
 """
+import html
 import json
 import os
-import random
 import re
 import subprocess
 import sys
@@ -23,40 +22,32 @@ from pathlib import Path
 import requests
 
 # ----------------------------------------------------------------- CONFIG
-GRUPO_WHATSAPP = os.getenv("GRUPO_WHATSAPP", "https://chat.whatsapp.com/Dm1Mv7qgbPRDNZN1zvLZRz")
-
-# Categorias do ML (Brasil). Ajuste à vontade.
-CATEGORIAS = {
-    "MLB1574": "Casa, Móveis e Decoração",
-    "MLB5726": "Eletrodomésticos",
-    "MLB1499": "Indústria e Comércio",  # tem muito utilitário de cozinha/limpeza
-    "MLB263532": "Ferramentas",
-}
-# Palavras que NÃO queremos (fora do nicho "achadinho para casa")
-BLOQUEADAS = ["geladeira", "fogão", "máquina de lavar", "lavadora", "sofá", "colchão",
-              "cama box", "guarda-roupa", "ar condicionado", "freezer", "televisor", "smart tv"]
-
-VOZ = os.getenv("VOZ", "pt-BR-AntonioNeural")   # ou pt-BR-FranciscaNeural / pt-BR-ThalitaNeural
-VELOCIDADE_VOZ = os.getenv("VELOCIDADE_VOZ", "+12%")
-VOLUME_ORIGINAL = float(os.getenv("VOLUME_ORIGINAL", "0.12"))  # áudio original do vídeo bem baixinho
-# True = no fallback do YouTube só usa vídeos Creative Commons (protege o canal de strike)
-SOMENTE_CREATIVE_COMMONS = os.getenv("SOMENTE_CREATIVE_COMMONS", "true").lower() == "true"
-PRIVACIDADE = os.getenv("PRIVACIDADE", "public")  # use "private" nos primeiros testes
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
-ML_TOKEN = os.getenv("ML_ACCESS_TOKEN", "")
+GRUPO_WHATSAPP = os.getenv("GRUPO_WHATSAPP") or "https://chat.whatsapp.com/Dm1Mv7qgbPRDNZN1zvLZRz"
+MAKE_WEBHOOK_URL = os.getenv("MAKE_WEBHOOK_URL", "")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
-YT_CLIENT_ID = os.getenv("YT_CLIENT_ID", "")
-YT_CLIENT_SECRET = os.getenv("YT_CLIENT_SECRET", "")
-YT_REFRESH_TOKEN = os.getenv("YT_REFRESH_TOKEN", "")
-YT_COOKIES = os.getenv("YT_COOKIES", "")  # opcional: cookies.txt (Netscape) p/ o yt-dlp não ser bloqueado
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() == "true"  # monta o vídeo mas não publica
+GEMINI_MODELS = [m for m in (os.getenv("GEMINI_MODEL", ""), "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash") if m]
+VOZ = os.getenv("VOZ") or "pt-BR-AntonioNeural"          # ou pt-BR-FranciscaNeural / pt-BR-ThalitaNeural
+VELOCIDADE_VOZ = os.getenv("VELOCIDADE_VOZ") or "+12%"
+DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("1", "true")
+REPO = os.getenv("GITHUB_REPOSITORY", "")
+
+BASE_MV = "https://www.mercadolivre.com.br/mais-vendidos/MLB1574"  # Casa, Móveis e Decoração
+# subcategorias com mais "achadinho que resolve dor" (nomes como aparecem no site)
+SUBCATS_PREFERIDAS = ["Cozinha", "Organização para Casa", "Cuidado da Casa e Lavanderia", "Banheiros",
+                      "Iluminação Residencial", "Segurança para Casa", "Jardim e Ar Livre"]
+EXTRAS = ["https://www.mercadolivre.com.br/mais-vendidos/MLB5726"]  # Eletrodomésticos (mini processador, etc.)
+BLOQUEADAS = ["papel higiênico", "papel higienico", "lava roupas", "sabão", "detergente", "água sanitária",
+              "agua sanitaria", "lençol", "lencol", "colchão", "colchao", "cortina", "sofá", "guarda-roupa",
+              "geladeira", "fogão", "fogao", "máquina de lavar", "ar condicionado", "tapete", "colcha", "ducha"]
+
+MAX_MB = 4.3  # Make grátis aceita arquivos de até 5 MB
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
 
 BASE = Path(__file__).parent
 TMP = BASE / "tmp"
 TMP.mkdir(exist_ok=True)
 HIST = BASE / "historico.json"
-ML = "https://api.mercadolibre.com"
 
 
 def log(*a):
@@ -64,194 +55,163 @@ def log(*a):
 
 
 def run(cmd, **kw):
-    log("$", " ".join(str(c) for c in cmd)[:300])
+    log("$", " ".join(str(c) for c in cmd)[:250])
     return subprocess.run(cmd, check=True, **kw)
 
 
-def carregar_historico():
-    if HIST.exists():
-        return json.loads(HIST.read_text(encoding="utf-8"))
-    return []
+def pid(url):
+    m = re.search(r"/p/(MLB\d+)", url) or re.search(r"(MLB)-?(\d+)", url)
+    if not m:
+        return url
+    return m.group(1) if m.lastindex == 1 else f"MLB{m.group(2)}"
 
 
-def salvar_historico(h):
-    HIST.write_text(json.dumps(h, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-# ----------------------------------------------------------------- 1. MERCADO LIVRE
-def ml_get(path, **params):
-    headers = {"Authorization": f"Bearer {ML_TOKEN}"} if ML_TOKEN else {}
-    r = requests.get(ML + path, headers=headers, params=params, timeout=30)
-    if r.status_code != 200:
-        log("ML", r.status_code, path, r.text[:200])
-        return None
-    return r.json()
-
-
-def detalhes(entry):
-    """Converte uma entrada do /highlights em produto padronizado."""
-    pid, tipo = entry["id"], entry.get("type", "ITEM")
-    if tipo == "PRODUCT":
-        p = ml_get(f"/products/{pid}")
-        if not p:
-            return None
-        item_id = (p.get("buy_box_winner") or {}).get("item_id")
-        video = None
-        if item_id:
-            it = ml_get(f"/items/{item_id}")
-            video = (it or {}).get("video_id")
-        return {
-            "id": pid,
-            "nome": p.get("name", ""),
-            "link": p.get("permalink") or f"https://www.mercadolivre.com.br/p/{pid}",
-            "fotos": [x.get("url") for x in p.get("pictures", [])][:3],
-            "video_id": video,
-            "descricao": (p.get("short_description") or {}).get("content", "")[:600],
-        }
-    it = ml_get(f"/items/{pid}")
-    if not it:
-        return None
-    return {
-        "id": pid,
-        "nome": it.get("title", ""),
-        "link": it.get("permalink", ""),
-        "fotos": [x.get("secure_url") for x in it.get("pictures", [])][:3],
-        "video_id": it.get("video_id"),
-        "descricao": "",
-    }
-
-
-def buscar_candidatos(historico, limite=25):
+# ----------------------------------------------------------------- 1. MAIS VENDIDOS (sem API)
+def coletar(page, historico):
     ja = {h["id"] for h in historico}
-    cand = []
-    cats = list(CATEGORIAS)
-    random.shuffle(cats)
-    for cat in cats:
-        hl = ml_get(f"/highlights/MLB/category/{cat}")
-        if not hl:
+    page.goto(BASE_MV, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(2500)
+    subcats = page.eval_on_selector_all(
+        "a.ui-search-link", "els => els.map(a => [a.innerText.trim(), a.href.split('#')[0].split('?')[0]])")
+    urls = [u for n, u in subcats if n in SUBCATS_PREFERIDAS and "/mais-vendidos/" in u] + EXTRAS
+    log("Subcategorias:", len(urls))
+    produtos = {}
+    for url in urls:
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(2000)
+            for _ in range(3):
+                page.mouse.wheel(0, 2500)
+                page.wait_for_timeout(600)
+            itens = page.eval_on_selector_all("a.poly-component__title", """els => els.map(a => {
+                const card = a.closest('.poly-card') || a.parentElement.parentElement;
+                return {titulo: a.innerText.trim(), link: a.href.split('#')[0].split('?')[0],
+                        info: (card ? card.innerText : '').replace(/\\s+/g,' ').slice(0, 200)};
+            })""")
+        except Exception as e:
+            log("falha em", url, e)
             continue
-        for e in hl.get("content", [])[:20]:
-            if e["id"] in ja:
+        for it in itens:
+            it["id"] = pid(it["link"])
+            low = it["titulo"].lower()
+            if it["id"] in ja or any(b in low for b in BLOQUEADAS):
                 continue
-            d = detalhes(e)
-            if not d or not d["nome"]:
-                continue
-            if any(b in d["nome"].lower() for b in BLOQUEADAS):
-                continue
-            d["categoria"] = CATEGORIAS[cat]
-            d["posicao"] = e.get("position")
-            cand.append(d)
-            if len(cand) >= limite:
-                return cand
-    return cand
+            produtos.setdefault(it["id"], it)
+    log(len(produtos), "produtos novos coletados")
+    return list(produtos.values())
 
 
-# ----------------------------------------------------------------- 2. GEMINI
-PROMPT = """Você é o roteirista do canal de YouTube Shorts "Achei pra Casa" (achadinhos para casa).
-Abaixo estão produtos MAIS VENDIDOS do Mercado Livre agora. Escolha UM: o que resolve uma DOR
-do dia a dia mais forte, mais visual, com mais cara de "viralizou" e mais fácil de entender em 3 segundos.
+def videos_do_produto(page, link):
+    """Os clips do anúncio vêm no HTML como "video_url": ".../playlists/....m3u8"."""
+    page.goto(link, wait_until="domcontentloaded", timeout=60000)
+    page.wait_for_timeout(2500)
+    src = page.content()
+    urls = []
+    for m in re.finditer(r'"video_url"\s*:\s*"([^"]+)"', src):
+        try:
+            u = json.loads('"' + m.group(1) + '"')
+        except ValueError:
+            u = m.group(1)
+        u = html.unescape(u)
+        if u.startswith("http") and u not in urls:
+            urls.append(u)
+    desc = ""
+    try:
+        desc = page.inner_text(".ui-pdp-description__content", timeout=3000)[:1200]
+    except Exception:
+        pass
+    return urls[:3], desc
 
-PRODUTOS (JSON):
-{produtos}
 
-Responda SOMENTE um JSON com estas chaves:
-- "id": id do produto escolhido (exatamente como veio)
-- "dor": a dor resolvida em poucas palavras
-- "titulo": título do Short em CAIXA ALTA, frase curta que ataca a DOR em tom de ordem/conselho,
-   SEM citar o nome do produto, máximo 45 caracteres. Exemplos do canal:
-   "PARE DE CHORAR PRA CORTAR CEBOLA", "CHEGA DE SOFRER PRA LIMPAR O FOGÃO", "NUNCA MAIS PERCA TEMPO DOBRANDO ROUPA"
+# ----------------------------------------------------------------- 2/4. GEMINI
+def gemini_json(prompt, temperatura=0.8):
+    body = {"contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": temperatura}}
+    for modelo in GEMINI_MODELS:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent"
+        for tentativa in range(3):
+            r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=120)
+            if r.status_code == 200:
+                txt = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+                return json.loads(re.sub(r"^```(?:json)?|```$", "", txt).strip())
+            log("Gemini", modelo, r.status_code, r.text[:200])
+            if r.status_code in (400, 404):
+                break  # modelo não existe -> próximo
+            time.sleep(10 * (tentativa + 1))
+    raise RuntimeError("Gemini falhou em todos os modelos")
+
+
+def ranquear(produtos):
+    topo = produtos[:60]
+    lista = "\n".join(f"{i}: {p['titulo'][:100]} | {p['info'][:90]}" for i, p in enumerate(topo))
+    r = gemini_json(
+        "Você escolhe produtos para Shorts virais de 'achadinhos para casa'. Abaixo estão os mais vendidos do "
+        "Mercado Livre. Ordene do MELHOR para o pior: resolve uma DOR clara do dia a dia, é visual/demonstrável "
+        "em vídeo, tem efeito 'uau', é barato e de compra por impulso. Descarte itens comuns de supermercado, "
+        "roupa de cama e produtos sem apelo visual.\n"
+        'Responda JSON: {"ordem": [índices, no máximo 10]}\n\n' + lista, 0.4)
+    ordem = [i for i in r.get("ordem", []) if isinstance(i, int) and 0 <= i < len(topo)]
+    return [topo[i] for i in ordem] or topo[:10]
+
+
+PROMPT_ROTEIRO = """Você é o roteirista do canal de YouTube Shorts "Achei pra Casa" (achadinhos para casa).
+Produto: {titulo}
+Info do anúncio: {info}
+Descrição do vendedor: {desc}
+
+Responda SOMENTE um JSON com:
+- "dor": a dor resolvida, em poucas palavras
+- "titulo": CAIXA ALTA, frase curta que ataca a DOR em tom de ordem/conselho, SEM o nome do produto,
+   máximo 45 caracteres. Exemplos do canal: "PARE DE CHORAR PRA CORTAR CEBOLA",
+   "CHEGA DE SOFRER PRA LIMPAR O FOGÃO", "NUNCA MAIS PERCA TEMPO DOBRANDO ROUPA"
 - "nome_curto": nome do produto em CAIXA ALTA, 2 a 4 palavras, sem marca (ex: "MINI TRITURADOR ELETRICO")
-- "hashtags_titulo": exatamente 3 hashtags; as duas primeiras SEMPRE "#achadinhos" e "#shopee",
-   a terceira do contexto (ex: "#dicas", "#cozinha", "#limpeza", "#organizacao")
-- "hashtags_descricao": 4 hashtags; SEMPRE "#achadinhos" e "#compras", mais 2 do contexto (ex: "#donadecasa")
-- "tags": 12 tags de SEO em minúsculas: sempre "achadinhos", "achadinhos para casa", "achadinhos shopee",
-   "compras para casa", e 8 específicas (o que o produto é, como as pessoas pesquisam a dor, ex: "como cortar cebola sem chorar")
-- "narracao": texto falado de 45 a 60 palavras (cerca de 20 a 25 segundos), português do Brasil natural,
-   muito persuasivo, frases curtas. Estrutura:
-     (1) GANCHO com a dor em 1 frase que prende ("Você ainda chora toda vez que corta cebola?")
-     (2) como o produto resolve, com 2 benefícios concretos e visuais
-     (3) prova social/urgência ("tá todo mundo comprando", "esgota rápido")
-     (4) CTA final: "Entra no nosso grupo do WhatsApp de achadinhos pra casa, com desconto todo dia! O link tá na descrição."
-   Não use emojis, hashtags, nem preço. Não diga "Shopee" nem "Mercado Livre".
-- "busca_video": termo curto para buscar um vídeo real desse produto no YouTube (ex: "mini triturador elétrico de alho usb")
+- "hashtags_titulo": exatamente 3 hashtags: "#achadinhos", "#shopee" e uma do contexto (ex: "#dicas", "#cozinha", "#limpeza")
+- "hashtags_descricao": 4 hashtags: "#achadinhos", "#compras" e 2 do contexto (ex: "#donadecasa", "#organizacao")
+- "tags": 12 tags em minúsculas: "achadinhos", "achadinhos para casa", "achadinhos shopee", "compras para casa"
+   e 8 específicas (o que é o produto e como as pessoas pesquisam a dor, ex: "como cortar cebola sem chorar")
+- "narracao": 45 a 60 palavras (20 a 25 segundos), português do Brasil natural, MUITO persuasivo, frases curtas:
+   (1) GANCHO com a dor em 1 pergunta que prende ("Você ainda chora toda vez que corta cebola?")
+   (2) como o produto resolve, com 2 benefícios concretos e visuais
+   (3) prova social/urgência ("tá todo mundo comprando", "esgota rápido")
+   (4) termine EXATAMENTE com: "Entra no nosso grupo do WhatsApp de achadinhos pra casa, com desconto todo dia! O link tá na descrição."
+   Sem emojis, sem hashtags, sem preço, sem dizer "Shopee" ou "Mercado Livre".
 """
 
 
-def gemini(produtos):
-    enxuto = [{k: p[k] for k in ("id", "nome", "categoria", "posicao", "descricao")} for p in produtos]
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
-    body = {
-        "contents": [{"parts": [{"text": PROMPT.format(produtos=json.dumps(enxuto, ensure_ascii=False))}]}],
-        "generationConfig": {"responseMimeType": "application/json", "temperature": 0.9},
-    }
-    for tentativa in range(4):
-        r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=90)
-        if r.status_code == 200:
-            txt = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return json.loads(re.sub(r"^```(json)?|```$", "", txt.strip()))
-        log("Gemini", r.status_code, r.text[:300])
-        time.sleep(15 * (tentativa + 1))
-    raise RuntimeError("Gemini falhou")
+def roteiro(prod, desc):
+    return gemini_json(PROMPT_ROTEIRO.format(titulo=prod["titulo"], info=prod["info"], desc=desc[:1000]), 0.9)
 
 
-# ----------------------------------------------------------------- 3. VÍDEO REAL
-def yt_service():
-    from google.oauth2.credentials import Credentials
-    from googleapiclient.discovery import build
-    creds = Credentials(None, refresh_token=YT_REFRESH_TOKEN, client_id=YT_CLIENT_ID,
-                        client_secret=YT_CLIENT_SECRET, token_uri="https://oauth2.googleapis.com/token")
-    return build("youtube", "v3", credentials=creds, cache_discovery=False)
-
-
-def baixar(url, destino):
-    cmd = ["yt-dlp", "-f", "bv*[height<=1920][ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
-           "--merge-output-format", "mp4", "--max-filesize", "150M", "-o", str(destino), url]
-    if YT_COOKIES:
-        ck = TMP / "cookies.txt"
-        ck.write_text(YT_COOKIES)
-        cmd[1:1] = ["--cookies", str(ck)]
-    try:
-        run(cmd)
-        return destino.exists() and destino.stat().st_size > 50_000
-    except subprocess.CalledProcessError:
-        return False
-
-
-def obter_video(produto, busca, yt):
-    destino = TMP / "original.mp4"
-    destino.unlink(missing_ok=True)
-    vid = produto.get("video_id")
-    # 3a. vídeo do próprio anúncio do Mercado Livre (vendedor)
-    if vid:
-        url = f"https://www.youtube.com/watch?v={vid}" if len(vid) == 11 else vid
-        log("Vídeo do anúncio:", url)
-        if baixar(url, destino):
-            return destino, url
-    # 3b. busca no YouTube (vídeos curtos, de preferência Creative Commons)
-    params = dict(part="id,snippet", q=busca, type="video", videoDuration="short",
-                  maxResults=10, regionCode="BR", relevanceLanguage="pt")
-    if SOMENTE_CREATIVE_COMMONS:
-        params["videoLicense"] = "creativeCommon"
-    res = yt.search().list(**params).execute()
-    for it in res.get("items", []):
-        url = f"https://www.youtube.com/watch?v={it['id']['videoId']}"
-        log("Tentando vídeo:", it["snippet"]["title"], url)
-        if baixar(url, destino):
-            return destino, url
-    return None, None
-
-
-# ----------------------------------------------------------------- 4. NARRAÇÃO + MONTAGEM
+# ----------------------------------------------------------------- 3/5. VÍDEO + VOZ + MONTAGEM
 def duracao(arq):
     out = subprocess.check_output(["ffprobe", "-v", "error", "-show_entries", "format=duration",
                                    "-of", "default=nw=1:nk=1", str(arq)])
     return float(out.strip())
 
 
-def tem_audio(arq):
-    out = subprocess.check_output(["ffprobe", "-v", "error", "-select_streams", "a",
-                                   "-show_entries", "stream=index", "-of", "csv=p=0", str(arq)])
-    return bool(out.strip())
+def baixar_clips(urls):
+    """Baixa até 3 clips (m3u8) e normaliza para 720x1280 sem áudio."""
+    partes = []
+    for i, u in enumerate(urls):
+        bruto, norm = TMP / f"clip{i}.mp4", TMP / f"clip{i}_n.mp4"
+        try:
+            http = ["-user_agent", UA, "-headers", "Referer: https://www.mercadolivre.com.br/\r\n"] \
+                if u.startswith("http") else []
+            run(["ffmpeg", "-y", "-loglevel", "error", *http, "-i", u, "-t", "40", "-c", "copy", str(bruto)])
+            run(["ffmpeg", "-y", "-loglevel", "error", "-i", str(bruto), "-an", "-vf",
+                 "scale=720:1280:force_original_aspect_ratio=increase,crop=720:1280,setsar=1,fps=30",
+                 "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", str(norm)])
+            if duracao(norm) > 2:
+                partes.append(norm)
+        except Exception as e:
+            log("clip falhou:", e)
+    if not partes:
+        return None
+    lista = TMP / "lista.txt"
+    lista.write_text("".join(f"file '{p.name}'\n" for p in partes))
+    final = TMP / "original.mp4"
+    run(["ffmpeg", "-y", "-loglevel", "error", "-f", "concat", "-safe", "0", "-i", str(lista), "-c", "copy", str(final)])
+    return final
 
 
 def narrar(texto):
@@ -262,101 +222,95 @@ def narrar(texto):
 
 def montar(video, narracao):
     final = TMP / "short.mp4"
-    dur = min(duracao(narracao) + 0.8, 59.0)
-    vdur = duracao(video)
-    # pula os primeiros segundos (geralmente vinheta) se o vídeo for comprido
-    inicio = 1.5 if vdur > dur + 4 else 0
-    vf = ("scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
-          "setsar=1,fps=30,eq=saturation=1.08:contrast=1.04")
-    if tem_audio(video):
-        af = (f"[0:a]volume={VOLUME_ORIGINAL}[bg];[1:a]volume=1.6,apad[nar];"
-              f"[bg][nar]amix=inputs=2:duration=longest:dropout_transition=0[a]")
-    else:
-        af = "[1:a]volume=1.6,apad[a]"
-    run(["ffmpeg", "-y", "-stream_loop", "-1", "-ss", str(inicio), "-i", str(video), "-i", str(narracao),
-         "-filter_complex", f"[0:v]{vf}[v];{af}", "-map", "[v]", "-map", "[a]",
-         "-t", f"{dur:.2f}", "-c:v", "libx264", "-preset", "medium", "-crf", "21",
-         "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", str(final)])
+    dur = min(duracao(narracao) + 0.8, 58.0)
+    audio_kbps = 96
+    video_kbps = int(min(2500, (MAX_MB * 8192) / dur - audio_kbps))  # cabe em < 5 MB
+    run(["ffmpeg", "-y", "-loglevel", "error", "-stream_loop", "-1", "-i", str(video), "-i", str(narracao),
+         "-filter_complex", "[0:v]eq=saturation=1.08:contrast=1.04[v];[1:a]volume=1.5,apad[a]",
+         "-map", "[v]", "-map", "[a]", "-t", f"{dur:.2f}",
+         "-c:v", "libx264", "-preset", "medium", "-b:v", f"{video_kbps}k", "-maxrate", f"{video_kbps}k",
+         "-bufsize", f"{video_kbps * 2}k", "-pix_fmt", "yuv420p",
+         "-c:a", "aac", "-b:a", f"{audio_kbps}k", "-movflags", "+faststart", str(final)])
+    log(f"Short: {dur:.1f}s, {final.stat().st_size / 1e6:.2f} MB")
     return final
 
 
-# ----------------------------------------------------------------- 5. YOUTUBE
-def descricao(roteiro, produto):
-    return (
-        "🛍️ LINK DE TODOS OS PRODUTOS AQUI\n\n"
-        f"🔴GRUPO VIP DE PROMOÇÕES NO WHATSAPP🔴\n{GRUPO_WHATSAPP}\n\n"
-        f"🛍️{roteiro['nome_curto']}\n{produto['link']}\n\n"
-        f"🟢GRUPO DE OFERTAS E CUPONS DE DESCONTO🟢\n{GRUPO_WHATSAPP}\n"
-        "O grupo é somente de postagem de produtos, sem chat.\n"
-        "Nele você encontra achadinhos para casa com cupons de desconto todos os dias!\n\n"
-        + " ".join(roteiro["hashtags_descricao"])
-    )
+# ----------------------------------------------------------------- 6. RELEASE + MAKE
+def descricao(r, prod):
+    return ("🛍️ LINK DE TODOS OS PRODUTOS AQUI\n\n"
+            f"🔴GRUPO VIP DE PROMOÇÕES NO WHATSAPP🔴\n{GRUPO_WHATSAPP}\n\n"
+            f"🛍️{r['nome_curto']}\n{prod['link']}\n\n"
+            f"🟢GRUPO DE OFERTAS E CUPONS DE DESCONTO🟢\n{GRUPO_WHATSAPP}\n"
+            "O grupo é somente de postagem de produtos, sem chat.\n"
+            "Nele você encontra achadinhos para casa com cupons de desconto todos os dias!\n\n"
+            + " ".join(r["hashtags_descricao"]))
 
 
-def publicar(yt, arquivo, roteiro, produto):
-    from googleapiclient.http import MediaFileUpload
-    titulo = f"{roteiro['titulo'].upper()}   {' '.join(roteiro['hashtags_titulo'])}"[:100]
-    body = {
-        "snippet": {
-            "title": titulo,
-            "description": descricao(roteiro, produto),
-            "tags": roteiro["tags"][:15],
-            "categoryId": "26",  # Guias e Estilo
-            "defaultLanguage": "pt-BR",
-            "defaultAudioLanguage": "pt-BR",
-        },
-        "status": {"privacyStatus": PRIVACIDADE, "selfDeclaredMadeForKids": False},
-    }
-    req = yt.videos().insert(part="snippet,status", body=body,
-                             media_body=MediaFileUpload(str(arquivo), chunksize=-1, resumable=True))
-    resp = None
-    while resp is None:
-        _, resp = req.next_chunk()
-    vid = resp["id"]
-    log("Publicado:", titulo, f"https://youtube.com/shorts/{vid}")
+def publicar_release(arquivo, tag):
+    run(["gh", "release", "create", tag, str(arquivo), "--repo", REPO, "--title", tag, "--notes", "Short gerado automaticamente"])
+    # mantém só os 15 releases mais recentes
     try:
-        yt.commentThreads().insert(part="snippet", body={"snippet": {
-            "videoId": vid,
-            "topLevelComment": {"snippet": {"textOriginal":
-                f"🔴 GRUPO VIP DE ACHADINHOS PRA CASA COM DESCONTO TODO DIA 👉 {GRUPO_WHATSAPP}"}}}}).execute()
-    except Exception as e:  # comentário é bônus, não derruba o fluxo
-        log("Comentário falhou:", e)
-    return vid, titulo
+        out = subprocess.check_output(["gh", "release", "list", "--repo", REPO, "--limit", "100", "--json", "tagName"])
+        for rel in json.loads(out)[15:]:
+            subprocess.run(["gh", "release", "delete", rel["tagName"], "--repo", REPO, "--yes", "--cleanup-tag"])
+    except Exception as e:
+        log("limpeza de releases:", e)
+    return f"https://github.com/{REPO}/releases/download/{tag}/short.mp4"
+
+
+def avisar_make(payload):
+    r = requests.post(MAKE_WEBHOOK_URL, json=payload, timeout=60)
+    log("Make respondeu:", r.status_code, r.text[:200])
+    r.raise_for_status()
 
 
 # ----------------------------------------------------------------- MAIN
 def main():
-    historico = carregar_historico()
-    candidatos = buscar_candidatos(historico)
-    log(f"{len(candidatos)} candidatos")
-    if not candidatos:
-        sys.exit("Nenhum produto novo. Confira o ML_ACCESS_TOKEN.")
+    from playwright.sync_api import sync_playwright
+    historico = json.loads(HIST.read_text(encoding="utf-8")) if HIST.exists() else []
+    with sync_playwright() as p:
+        nav = p.chromium.launch(headless=True)
+        page = nav.new_context(user_agent=UA, locale="pt-BR", viewport={"width": 1366, "height": 900}).new_page()
+        candidatos = coletar(page, historico)
+        if not candidatos:
+            sys.exit("Nenhum produto coletado (o ML pode ter mudado o layout ou bloqueado o acesso).")
+        escolhido = None
+        for prod in ranquear(candidatos):
+            log("Checando vídeo de:", prod["titulo"])
+            try:
+                clips, desc = videos_do_produto(page, prod["link"])
+            except Exception as e:
+                log("página falhou:", e)
+                continue
+            if not clips:
+                log("  sem vídeo no anúncio")
+                continue
+            video = baixar_clips(clips)
+            if video:
+                escolhido = (prod, desc, video)
+                break
+        nav.close()
+    if not escolhido:
+        sys.exit("Nenhum dos melhores produtos tinha vídeo real nesta rodada.")
 
-    yt = yt_service()
-    tentados = set()
-    for _ in range(4):  # até 4 produtos diferentes se não achar vídeo
-        restantes = [c for c in candidatos if c["id"] not in tentados]
-        if not restantes:
-            break
-        roteiro = gemini(restantes)
-        produto = next((c for c in restantes if c["id"] == roteiro["id"]), restantes[0])
-        tentados.add(produto["id"])
-        log("Escolhido:", produto["nome"], "| dor:", roteiro.get("dor"))
-        video, fonte = obter_video(produto, roteiro["busca_video"], yt)
-        if not video:
-            log("Sem vídeo real para", produto["nome"], "— tentando outro produto")
-            continue
-        final = montar(video, narrar(roteiro["narracao"]))
-        (TMP / "roteiro.json").write_text(json.dumps(roteiro, ensure_ascii=False, indent=2), encoding="utf-8")
-        if DRY_RUN:
-            log("DRY_RUN: vídeo pronto em", final)
-            return
-        vid, titulo = publicar(yt, final, roteiro, produto)
-        historico.append({"id": produto["id"], "nome": produto["nome"], "youtube": vid,
-                          "titulo": titulo, "fonte_video": fonte, "data": time.strftime("%Y-%m-%d %H:%M")})
-        salvar_historico(historico)
+    prod, desc, video = escolhido
+    r = roteiro(prod, desc)
+    log("Produto:", prod["titulo"], "| dor:", r.get("dor"))
+    final = montar(video, narrar(r["narracao"]))
+    titulo = f"{r['titulo'].upper()}   {' '.join(r['hashtags_titulo'])}"[:100]
+    payload = {"titulo": titulo, "descricao": descricao(r, prod), "tags": ",".join(r["tags"][:15]),
+               "produto": prod["titulo"], "link_produto": prod["link"], "narracao": r["narracao"],
+               "comentario": f"🔴 GRUPO VIP DE ACHADINHOS PRA CASA COM DESCONTO TODO DIA 👉 {GRUPO_WHATSAPP}"}
+    (TMP / "roteiro.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    if DRY_RUN:
+        log("DRY_RUN: vídeo pronto, não publicado. Baixe em Artifacts.")
         return
-    sys.exit("Não achei vídeo real para nenhum candidato nesta rodada.")
+    tag = f"short-{time.strftime('%Y%m%d-%H%M')}"
+    payload["video_url"] = publicar_release(final, tag)
+    avisar_make(payload)
+    historico.append({"id": prod["id"], "produto": prod["titulo"], "titulo": titulo,
+                      "release": tag, "data": time.strftime("%Y-%m-%d %H:%M")})
+    HIST.write_text(json.dumps(historico, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
