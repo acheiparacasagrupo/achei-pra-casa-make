@@ -24,11 +24,11 @@ from pathlib import Path
 import requests
 
 # ----------------------------------------------------------------- CONFIG
-GRUPO_WHATSAPP = os.getenv("GRUPO_WHATSAPP") or "https://chat.whatsapp.com/Dm1Mv7qgbPRDNZN1zvLZRz"
+GRUPO_WHATSAPP = os.getenv("GRUPO_WHATSAPP") or "https://acheipracasapromocoes.lovable.app/"
 MAKE_WEBHOOK_URL = os.getenv("MAKE_WEBHOOK_URL", "")
 GEMINI_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODELS = [m for m in (os.getenv("GEMINI_MODEL", ""), "gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash") if m]
-VOZ = os.getenv("VOZ") or "pt-BR-AntonioNeural"          # ou pt-BR-FranciscaNeural / pt-BR-ThalitaNeural
+GEMINI_MODELS = [m for m in (os.getenv("GEMINI_MODEL", ""), "gemini-3.8-flash", "gemini-3.5-flash-lite") if m]
+VOZ = os.getenv("VOZ") or "pt-BR-FranciscaNeural"          # ou pt-BR-FranciscaNeural / pt-BR-ThalitaNeural
 VELOCIDADE_VOZ = os.getenv("VELOCIDADE_VOZ") or "+12%"
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("1", "true")
 REPO = os.getenv("GITHUB_REPOSITORY", "")
@@ -58,20 +58,46 @@ FILA = Path(__file__).parent / "fila.json"
 
 
 # ----------------------------------------------------------------- 2/4. GEMINI
+def modelos_disponiveis():
+    """Pergunta ao Google quais modelos 'flash' existem (se um modelo for desativado, o fluxo se adapta sozinho)."""
+    try:
+        r = requests.get("https://generativelanguage.googleapis.com/v1beta/models",
+                         params={"key": GEMINI_KEY, "pageSize": 200}, timeout=30)
+        nomes = [m["name"].split("/")[-1] for m in r.json().get("models", [])
+                 if "generateContent" in m.get("supportedGenerationMethods", [])]
+        flash = [n for n in nomes if "flash" in n and not any(x in n for x in ("image", "tts", "audio", "live", "thinking"))]
+        # mais novos primeiro
+        return sorted(flash, key=lambda n: re.findall(r"[\d.]+", n) and float(re.findall(r"\d+(?:\.\d+)?", n)[0]), reverse=True)
+    except Exception as e:
+        log("não consegui listar modelos:", e)
+        return []
+
+
 def gemini_json(prompt, temperatura=0.8):
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": temperatura}}
-    for modelo in GEMINI_MODELS:
+    tentados = []
+    fila_modelos = list(GEMINI_MODELS)
+    descobriu = False
+    while fila_modelos:
+        modelo = fila_modelos.pop(0)
+        if modelo in tentados:
+            continue
+        tentados.append(modelo)
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent"
         for tentativa in range(3):
             r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=120)
             if r.status_code == 200:
                 txt = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
                 return json.loads(re.sub(r"^```(?:json)?|```$", "", txt).strip())
-            log("Gemini", modelo, r.status_code, r.text[:200])
-            if r.status_code in (400, 404):
-                break  # modelo não existe -> próximo
+            log("Gemini", modelo, r.status_code, r.text[:160])
+            if r.status_code in (400, 403, 404):
+                break  # modelo indisponível -> próximo
             time.sleep(10 * (tentativa + 1))
+        if not fila_modelos and not descobriu:
+            descobriu = True
+            fila_modelos = [m for m in modelos_disponiveis() if m not in tentados]
+            log("Modelos descobertos:", fila_modelos[:5])
     raise RuntimeError("Gemini falhou em todos os modelos")
 
 
