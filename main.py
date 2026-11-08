@@ -34,8 +34,11 @@ VELOCIDADE_VOZ = os.getenv("VELOCIDADE_VOZ") or "+12%"
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in ("1", "true")
 REPO = os.getenv("GITHUB_REPOSITORY", "")
 
-COMENTARIO = os.getenv("COMENTARIO") or ("🔴 O LINK DO GRUPO VIP COM OFERTAS PRA CASA TODO DIA TÁ NA BIO DO CANAL! 👆 "
-                                         "Toca no nome do canal e entra no grupo do WhatsApp 🛒")
+COMENTARIO = os.getenv("COMENTARIO") or (
+    "🔴 O LINK DO GRUPO VIP COM OFERTAS PRA CASA TODO DIA TÁ NA BIO DO CANAL! 👆 "
+    "Toca no nome do canal e entra no grupo do WhatsApp 🛒\n\n"
+    "Ou, se preferir, pode entrar no grupo por este link abaixo 👇\n"
+    + GRUPO_WHATSAPP)
 MAX_MB = 4.3  # Make grátis aceita arquivos de até 5 MB
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
@@ -403,7 +406,7 @@ def main():
     payload = {"titulo": titulo, "descricao": descricao(r, prod).replace("<", "").replace(">", ""),
                "tags": ",".join(t.replace(",", " ") for t in r["tags"][:15]),
                "produto": prod["titulo"], "link_produto": prod["link"], "narracao": r["narracao"],
-               "comentario": COMENTARIO}
+               "comentario": json.dumps(COMENTARIO, ensure_ascii=False)[1:-1]}
     (TMP / "roteiro.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     if DRY_RUN:
         log("DRY_RUN: vídeo pronto, não publicado. Baixe em Artifacts.")
