@@ -250,13 +250,30 @@ def roteiro_emergencia(prod):
     }
 
 
+def _lista(v):
+    """Aceita lista ou texto ('#a #b, #c') e devolve lista limpa."""
+    if isinstance(v, str):
+        v = re.split(r"[,\s]+", v)
+    return [str(x).strip() for x in (v or []) if str(x).strip()]
+
+
+def normalizar(r):
+    r["hashtags_titulo"] = ["#" + h.lstrip("#") for h in _lista(r.get("hashtags_titulo"))][:3] or ["#achadinhos", "#shopee", "#dicas"]
+    r["hashtags_contexto"] = _lista(r.get("hashtags_contexto") or r.get("hashtags_descricao"))
+    tags = r.get("tags")
+    r["tags"] = [t.strip() for t in (tags.split(",") if isinstance(tags, str) else (tags or [])) if str(t).strip()]
+    r["titulo"] = re.sub(r"#\S+", "", str(r.get("titulo", ""))).strip()
+    r["nome_curto"] = str(r.get("nome_curto", "")).strip()
+    return r
+
+
 def roteiro(prod, desc):
     r = gemini_json(PROMPT_ROTEIRO.format(titulo=prod["titulo"], info=prod.get("info", ""), desc=desc[:1000]), 0.9)
     obrig = ("titulo", "nome_curto", "hashtags_titulo", "tags", "narracao")
     if not r or any(k not in r for k in obrig):
         log("Roteiro da IA incompleto — usando roteiro de emergência")
         return roteiro_emergencia(prod)
-    return r
+    return normalizar(r)
 
 
 # ----------------------------------------------------------------- 3/5. VÍDEO + VOZ + MONTAGEM
