@@ -84,25 +84,29 @@ def _gemini(prompt, temperatura):
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": temperatura}}
     tentados, fila_modelos, descobriu = [], list(GEMINI_MODELS), False
-    while fila_modelos:
+    limite = time.time() + 70  # orçamento total do Gemini: ~1 minuto, depois passa para a próxima IA
+    while fila_modelos and time.time() < limite:
         modelo = fila_modelos.pop(0)
         if modelo in tentados:
             continue
         tentados.append(modelo)
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent"
         for tentativa in range(2):
+            if time.time() >= limite:
+                break
             try:
-                r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=90)
+                r = requests.post(url, params={"key": GEMINI_KEY}, json=body,
+                                  timeout=max(10, min(35, limite - time.time())))
             except Exception as e:
                 log("Gemini", modelo, "erro de rede:", e)
                 continue
             if r.status_code == 200:
                 return _limpar_json(r.json()["candidates"][0]["content"]["parts"][0]["text"])
             log("Gemini", modelo, r.status_code, r.text[:120].replace("\n", " "))
-            if r.status_code in (400, 403, 404):
+            if r.status_code in (400, 403, 404, 429):
                 break
-            time.sleep(8)
-        if not fila_modelos and not descobriu:
+            time.sleep(4)
+        if not fila_modelos and not descobriu and time.time() < limite:
             descobriu = True
             fila_modelos = [m for m in modelos_disponiveis() if m not in tentados][:3]
     return None
@@ -123,7 +127,7 @@ def _github_models(prompt, temperatura):
                               json={"model": modelo, "temperature": temperatura,
                                     "messages": [{"role": "system", "content": "Responda sempre SOMENTE com um JSON válido."},
                                                  {"role": "user", "content": prompt}]},
-                              timeout=90)
+                              timeout=45)
             if r.status_code == 200:
                 return _limpar_json(r.json()["choices"][0]["message"]["content"])
             log("GitHub Models", modelo, r.status_code, r.text[:120].replace("\n", " "))
