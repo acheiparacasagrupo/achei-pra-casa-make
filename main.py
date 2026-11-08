@@ -15,6 +15,7 @@ import html
 import unicodedata
 import json
 import os
+import random
 import re
 import subprocess
 import sys
@@ -73,32 +74,97 @@ def modelos_disponiveis():
         return []
 
 
-def gemini_json(prompt, temperatura=0.8):
+def _limpar_json(txt):
+    txt = re.sub(r"^```(?:json)?|```$", "", txt.strip()).strip()
+    m = re.search(r"\{[\s\S]*\}", txt)
+    return json.loads(m.group(0) if m else txt)
+
+
+def _gemini(prompt, temperatura):
     body = {"contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": temperatura}}
-    tentados = []
-    fila_modelos = list(GEMINI_MODELS)
-    descobriu = False
+    tentados, fila_modelos, descobriu = [], list(GEMINI_MODELS), False
     while fila_modelos:
         modelo = fila_modelos.pop(0)
         if modelo in tentados:
             continue
         tentados.append(modelo)
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{modelo}:generateContent"
-        for tentativa in range(3):
-            r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=120)
+        for tentativa in range(2):
+            try:
+                r = requests.post(url, params={"key": GEMINI_KEY}, json=body, timeout=90)
+            except Exception as e:
+                log("Gemini", modelo, "erro de rede:", e)
+                continue
             if r.status_code == 200:
-                txt = r.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
-                return json.loads(re.sub(r"^```(?:json)?|```$", "", txt).strip())
-            log("Gemini", modelo, r.status_code, r.text[:160])
+                return _limpar_json(r.json()["candidates"][0]["content"]["parts"][0]["text"])
+            log("Gemini", modelo, r.status_code, r.text[:120].replace("\n", " "))
             if r.status_code in (400, 403, 404):
-                break  # modelo indisponível -> próximo
-            time.sleep(10 * (tentativa + 1))
+                break
+            time.sleep(8)
         if not fila_modelos and not descobriu:
             descobriu = True
-            fila_modelos = [m for m in modelos_disponiveis() if m not in tentados]
-            log("Modelos descobertos:", fila_modelos[:5])
-    raise RuntimeError("Gemini falhou em todos os modelos")
+            fila_modelos = [m for m in modelos_disponiveis() if m not in tentados][:3]
+    return None
+
+
+# GitHub Models: grátis dentro do GitHub Actions (usa o próprio GITHUB_TOKEN, sem chave nova)
+GITHUB_MODELS = ["openai/gpt-4.1-mini", "openai/gpt-4o-mini", "meta/Llama-3.3-70B-Instruct", "mistral-ai/mistral-small-2503"]
+
+
+def _github_models(prompt, temperatura):
+    token = os.getenv("GH_TOKEN") or os.getenv("GITHUB_TOKEN")
+    if not token:
+        return None
+    for modelo in GITHUB_MODELS:
+        try:
+            r = requests.post("https://models.github.ai/inference/chat/completions",
+                              headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                              json={"model": modelo, "temperature": temperatura,
+                                    "messages": [{"role": "system", "content": "Responda sempre SOMENTE com um JSON válido."},
+                                                 {"role": "user", "content": prompt}]},
+                              timeout=90)
+            if r.status_code == 200:
+                return _limpar_json(r.json()["choices"][0]["message"]["content"])
+            log("GitHub Models", modelo, r.status_code, r.text[:120].replace("\n", " "))
+        except Exception as e:
+            log("GitHub Models", modelo, "erro:", e)
+    return None
+
+
+# Groq (opcional): só é usado se você criar o secret GROQ_API_KEY (grátis em console.groq.com)
+def _groq(prompt, temperatura):
+    chave = os.getenv("GROQ_API_KEY")
+    if not chave:
+        return None
+    for modelo in ("llama-3.3-70b-versatile", "llama-3.1-8b-instant"):
+        try:
+            r = requests.post("https://api.groq.com/openai/v1/chat/completions",
+                              headers={"Authorization": f"Bearer {chave}"},
+                              json={"model": modelo, "temperature": temperatura,
+                                    "response_format": {"type": "json_object"},
+                                    "messages": [{"role": "user", "content": prompt}]}, timeout=90)
+            if r.status_code == 200:
+                return _limpar_json(r.json()["choices"][0]["message"]["content"])
+            log("Groq", modelo, r.status_code, r.text[:120])
+        except Exception as e:
+            log("Groq", modelo, "erro:", e)
+    return None
+
+
+def gemini_json(prompt, temperatura=0.8):
+    """Tenta várias IAs grátis em sequência. Retorna None só se TODAS falharem."""
+    for nome, fn in (("Gemini", _gemini), ("GitHub Models", _github_models), ("Groq", _groq)):
+        try:
+            res = fn(prompt, temperatura)
+        except Exception as e:
+            log(nome, "falhou:", e)
+            res = None
+        if isinstance(res, dict):
+            log("IA usada:", nome)
+            return res
+    log("Todas as IAs falharam — usando plano de emergência sem IA")
+    return None
 
 
 def ranquear(produtos, recentes=()):
@@ -112,6 +178,8 @@ def ranquear(produtos, recentes=()):
         "IMPORTANTE: varie! NÃO escolha primeiro um produto do mesmo tipo destes postados recentemente: "
         + "; ".join(recentes) + "\n"
         'Responda JSON: {"ordem": [índices, no máximo 10]}\n\n' + lista, 0.4)
+    if not r:
+        return sorted(topo, key=lambda p: -vendas(p.get("info", "")))
     ordem = [i for i in r.get("ordem", []) if isinstance(i, int) and 0 <= i < len(topo)]
     return [topo[i] for i in ordem] or topo[:10]
 
@@ -141,8 +209,50 @@ Responda SOMENTE um JSON com:
 """
 
 
+def vendas(info):
+    m = re.search(r"([\d.,]+)\s*(mil|M)?", info or "")
+    if not m:
+        return 0
+    n = float(m.group(1).replace(".", "").replace(",", "."))
+    return n * (1000 if m.group(2) == "mil" else 1_000_000 if m.group(2) == "M" else 1)
+
+
+def nome_curto(titulo):
+    palavras = [w for w in re.sub(r"[^\wÀ-ú ]", " ", titulo).split() if not w.isdigit()]
+    ignorar = {"kit", "com", "para", "de", "da", "do", "e", "em", "cor", "un", "pçs", "peças"}
+    uteis = [w for w in palavras if w.lower() not in ignorar][:3]
+    return " ".join(uteis).upper() or "ACHADINHO PRA CASA"
+
+
+def roteiro_emergencia(prod):
+    """Sem IA: roteiro-modelo persuasivo montado a partir do nome do produto."""
+    nome = nome_curto(prod["titulo"])
+    vend = prod.get("info") or "milhares de vendidos"
+    titulos = ["VOCÊ PRECISA DISSO NA SUA CASA", "O ACHADINHO QUE TODO MUNDO TÁ COMPRANDO",
+               "EU NÃO SABIA QUE PRECISAVA DISSO", "ISSO VAI FACILITAR SUA VIDA EM CASA"]
+    return {
+        "dor": "praticidade em casa",
+        "titulo": random.choice(titulos),
+        "nome_curto": nome,
+        "hashtags_titulo": ["#achadinhos", "#shopee", "#dicas"],
+        "hashtags_contexto": ["#utilidades", "#casaorganizada", "#donadecasa", "#praticidade"],
+        "tags": ["achadinhos", "achadinhos para casa", "achadinhos shopee", "compras para casa",
+                 nome.lower(), "utilidades para casa", "casa organizada", "produtos virais",
+                 "achados mercado livre", "dicas para casa", "praticidade", "facilidades para casa"],
+        "narracao": (f"Sabe aquela tarefa de casa que dá trabalho e toma o seu tempo? "
+                     f"Olha esse achadinho aqui: {nome.lower()}. Prático, fácil de usar e deixa o seu dia a dia muito mais simples. "
+                     f"Já são {vend.replace('+', 'mais de ')} e tá todo mundo comprando, então corre que esgota rápido! "
+                     "Entra no nosso grupo do WhatsApp de achadinhos pra casa, com desconto todo dia! O link tá na descrição."),
+    }
+
+
 def roteiro(prod, desc):
-    return gemini_json(PROMPT_ROTEIRO.format(titulo=prod["titulo"], info=prod.get("info", ""), desc=desc[:1000]), 0.9)
+    r = gemini_json(PROMPT_ROTEIRO.format(titulo=prod["titulo"], info=prod.get("info", ""), desc=desc[:1000]), 0.9)
+    obrig = ("titulo", "nome_curto", "hashtags_titulo", "tags", "narracao")
+    if not r or any(k not in r for k in obrig):
+        log("Roteiro da IA incompleto — usando roteiro de emergência")
+        return roteiro_emergencia(prod)
+    return r
 
 
 # ----------------------------------------------------------------- 3/5. VÍDEO + VOZ + MONTAGEM
