@@ -24,6 +24,8 @@ from pathlib import Path
 
 import requests
 
+import filtros
+
 # ----------------------------------------------------------------- CONFIG
 GRUPO_WHATSAPP = os.getenv("GRUPO_WHATSAPP") or "https://acheipracasapromocoes.lovable.app/"
 MAKE_WEBHOOK_URL = os.getenv("MAKE_WEBHOOK_URL", "")
@@ -178,10 +180,13 @@ def ranquear(produtos, recentes=()):
     topo = produtos[:60]
     lista = "\n".join(f"{i}: {p['titulo'][:100]} | {p.get('info','')[:90]}" for i, p in enumerate(topo))
     r = gemini_json(
-        "Você escolhe produtos para Shorts virais de 'achadinhos para casa'. Abaixo estão os mais vendidos do "
-        "Mercado Livre. Ordene do MELHOR para o pior: resolve uma DOR clara do dia a dia, é visual/demonstrável "
-        "em vídeo, tem efeito 'uau', é barato e de compra por impulso. Descarte itens comuns de supermercado, "
-        "roupa de cama e produtos sem apelo visual.\n"
+        "Você é curador de um canal de Shorts de ACHADINHOS PARA CASA (estilo 'achei na internet e precisei comprar'). "
+        "Abaixo estão produtos do Mercado Livre que já vendem bem. Ordene do MELHOR para o pior. O MELHOR é: "
+        "(1) um achadinho INOVADOR/curioso, que a maioria das pessoas ainda não conhece ou nunca viu funcionando; "
+        "(2) resolve uma dor clara do dia a dia em casa; (3) é muito visual e mostra o 'antes e depois' em segundos; "
+        "(4) barato, compra por impulso; (5) vende bastante (veja os vendidos). "
+        "Coloque no FIM ou deixe de fora produtos básicos que todo mundo já tem ou compra no mercado "
+        "(eletrodoméstico comum, produto de limpeza de marca, toalha, lâmpada, panela, cabide comum, pote comum). "
         "IMPORTANTE: varie! NÃO escolha primeiro um produto do mesmo tipo destes postados recentemente: "
         + "; ".join(recentes) + "\n"
         'Responda JSON: {"ordem": [índices, no máximo 10]}\n\n' + lista, 0.4)
@@ -380,7 +385,18 @@ def main():
     historico = json.loads(HIST.read_text(encoding="utf-8")) if HIST.exists() else []
     fila = json.loads(FILA.read_text(encoding="utf-8")) if FILA.exists() else []
     feitos = {h["id"] for h in historico}
-    fila = [p for p in fila if p["id"] not in feitos and p.get("videos")]
+    tipos_recentes = {filtros.tipo(h.get("produto", "")) for h in historico[-30:] if h.get("produto")}
+    vistos, limpa = set(), []
+    for p in fila:
+        t = filtros.tipo(p["titulo"])
+        if p["id"] in feitos or not p.get("videos") or filtros.bloqueado(p["titulo"]):
+            continue
+        if t in tipos_recentes or t in vistos:
+            continue
+        vistos.add(t)
+        limpa.append(p)
+    log(f"Fila: {len(fila)} produtos | {len(limpa)} aprovados (achadinhos, sem repetir tipo dos últimos 30 posts)")
+    fila = limpa
     if not fila:
         log("Fila vazia: a extensão do Chrome ainda não mandou produtos novos. Nada a fazer agora.")
         return
